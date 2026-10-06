@@ -14,7 +14,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 from .lottery_engine import GAME_FRONT, GAME_RED, LotteryDB, parse_ticket
-from .scratch import DEFAULT_TIERS, LEGACY_TIERS, find_font, make_card, parse_tier, render_card, validate_table
+from .scratch import DEFAULT_TIERS, LEGACY_TIERS, TIERS, find_font, make_card, parse_tier, render_card, validate_table
 
 
 @register("astrbot_plugin_lottery_game", "DITF16", "双色球、大乐透与刮刮乐小游戏", "1.1.0")
