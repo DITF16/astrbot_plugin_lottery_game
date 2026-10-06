@@ -7,6 +7,7 @@ import json
 import random
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -202,7 +203,8 @@ class LotteryDB:
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
@@ -240,46 +242,97 @@ class LotteryDB:
                 stake INTEGER NOT NULL,
                 settled INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS scratch_sales (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_key TEXT UNIQUE,
+                user_id TEXT NOT NULL,
+                tier INTEGER NOT NULL,
+                prize INTEGER NOT NULL,
+                card_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
+
+    def scratch_seen(self, message_key: str) -> bool:
+        with self._lock:
+            return bool(message_key and self.conn.execute(
+                "SELECT 1 FROM scratch_sales WHERE message_key=?", (message_key,)
+            ).fetchone())
+
+    def buy_scratch(self, user_id, nickname, day, card, message_key):
+        # Lock before reading balances or event IDs, including across plugin instances.
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                if self.scratch_seen(message_key):
+                    self.conn.rollback()
+                    return None
+                self.upsert_player(user_id, nickname, day)
+                balance = int(self.player(user_id)["balance"])
+                if balance < card.tier:
+                    raise ValueError(f"余额不足，需要 {card.tier} 龙门币，当前余额 {balance}。")
+                prize = card.total
+                self.conn.execute(
+                    "UPDATE players SET balance=balance-?+?, total_winnings=total_winnings+? WHERE user_id=?",
+                    (card.tier, prize, prize, user_id),
+                )
+                result = self.conn.execute(
+                    "INSERT INTO scratch_sales(message_key,user_id,tier,prize,card_json,created_at) VALUES(?,?,?,?,?,?)",
+                    (message_key or None, user_id, card.tier, prize,
+                     json.dumps(card.to_dict(), ensure_ascii=False), day),
+                )
+                self.conn.commit()
+                return int(result.lastrowid), balance - card.tier + prize
+            except BaseException:
+                self.conn.rollback()
+                raise
 
     def upsert_player(self, user_id: str, nickname: str, today: str) -> None:
-        self.conn.execute(
-            """INSERT INTO players(user_id, nickname, last_nickname_date) VALUES(?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                nickname=CASE WHEN players.last_nickname_date IS NULL OR players.last_nickname_date <> excluded.last_nickname_date
-                    THEN excluded.nickname ELSE players.nickname END,
-                last_nickname_date=excluded.last_nickname_date""",
-            (user_id, nickname, today),
-        )
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO players(user_id, nickname, last_nickname_date) VALUES(?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    nickname=CASE WHEN players.last_nickname_date IS NULL OR players.last_nickname_date <> excluded.last_nickname_date
+                        THEN excluded.nickname ELSE players.nickname END,
+                    last_nickname_date=excluded.last_nickname_date""",
+                (user_id, nickname, today),
+            )
+
+    def ensure_player(self, user_id: str, nickname: str, today: str) -> sqlite3.Row:
+        with self._lock, self.conn:
+            self.upsert_player(user_id, nickname, today)
+            return self.player(user_id)
 
     def add_balance(self, user_id: str, amount: int) -> int:
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute("UPDATE players SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-        return int(self.player(user_id)["balance"])
+            return int(self.player(user_id)["balance"])
 
     def record_scratch(self, user_id: str, tier: int, prize: int) -> None:
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS scratch_history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, tier INTEGER, prize INTEGER, created_at TEXT)"
-        )
-        self.conn.execute(
-            "INSERT INTO scratch_history(user_id, tier, prize, created_at) VALUES(?, ?, ?, ?)",
-            (user_id, tier, prize, datetime.now().isoformat(timespec="seconds")),
-        )
-        self.conn.commit()
+        with self._lock, self.conn:
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS scratch_history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, tier INTEGER, prize INTEGER, created_at TEXT)"
+            )
+            self.conn.execute(
+                "INSERT INTO scratch_history(user_id, tier, prize, created_at) VALUES(?, ?, ?, ?)",
+                (user_id, tier, prize, datetime.now().isoformat(timespec="seconds")),
+            )
 
     def player(self, user_id: str) -> sqlite3.Row:
-        row = self.conn.execute("SELECT * FROM players WHERE user_id = ?", (user_id,)).fetchone()
-        if row is None:
-            raise ValueError("玩家记录不存在。")
-        return row
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM players WHERE user_id = ?", (user_id,)).fetchone()
+            if row is None:
+                raise ValueError("玩家记录不存在。")
+            return row
 
     def checkin(self, user_id: str, nickname: str, day: str, amount: int) -> tuple[bool, int]:
-        with self.conn:
+        with self._lock, self.conn:
             self.upsert_player(user_id, nickname, day)
             inserted = self.conn.execute(
                 "INSERT OR IGNORE INTO checkins(user_id, day) VALUES(?, ?)", (user_id, day)
@@ -289,7 +342,7 @@ class LotteryDB:
             return bool(inserted), int(self.player(user_id)["balance"])
 
     def buy(self, user_id: str, nickname: str, day: str, spec: TicketSpec, draw_date: str) -> int:
-        with self.conn:
+        with self._lock, self.conn:
             self.upsert_player(user_id, nickname, day)
             balance = int(self.player(user_id)["balance"])
             if balance < spec.stake:
@@ -302,60 +355,63 @@ class LotteryDB:
             return int(cur.lastrowid)
 
     def get_draw(self, game: str, draw_date: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        row = self.conn.execute("SELECT * FROM draws WHERE game = ? AND draw_date = ?", (game, draw_date)).fetchone()
-        if row is None:
-            numbers = generate_draw(game)
-            self.conn.execute(
-                "INSERT INTO draws(game, draw_date, primary_numbers, secondary_numbers) VALUES(?, ?, ?, ?)",
-                (game, draw_date, json.dumps(numbers[0]), json.dumps(numbers[1])),
-            )
-            self.conn.commit()
-            return numbers
-        return tuple(json.loads(row["primary_numbers"])), tuple(json.loads(row["secondary_numbers"]))
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM draws WHERE game = ? AND draw_date = ?", (game, draw_date)).fetchone()
+            if row is None:
+                numbers = generate_draw(game)
+                self.conn.execute(
+                    "INSERT INTO draws(game, draw_date, primary_numbers, secondary_numbers) VALUES(?, ?, ?, ?)",
+                    (game, draw_date, json.dumps(numbers[0]), json.dumps(numbers[1])),
+                )
+                self.conn.commit()
+                return numbers
+            return tuple(json.loads(row["primary_numbers"])), tuple(json.loads(row["secondary_numbers"]))
 
     def settle(self, user_id: str, game: str, today: str, history_days: int) -> dict[str, Any]:
-        cutoff = (date.fromisoformat(today) - timedelta(days=history_days - 1)).isoformat()
-        tickets = self.conn.execute(
-            "SELECT * FROM tickets WHERE user_id = ? AND game = ? AND settled = 0 AND draw_date >= ? AND draw_date < ?",
-            (user_id, game, cutoff, today),
-        ).fetchall()
-        total = 0
-        detail: list[str] = []
-        with self.conn:
-            for ticket in tickets:
-                spec = TicketSpec(**json.loads(ticket["spec_json"]))
-                winning = self.get_draw(game, ticket["draw_date"])
-                ticket_total = 0
-                for primary in _ticket_primary_combinations(spec):
-                    for secondary in _ticket_secondary_combinations(spec):
-                        level, amount = prize_level(
-                            game,
-                            len(set(primary) & set(winning[0])),
-                            len(set(secondary) & set(winning[1])),
-                        )
-                        if amount:
-                            if game == GAME_FRONT and spec.additional and level in (1, 2):
-                                amount = int(amount * 1.8)
-                            ticket_total += amount * spec.multiplier
-                total += ticket_total
-                detail.append(f"{ticket['draw_date']}：{ticket_total} 龙门币")
-                self.conn.execute("UPDATE tickets SET settled = 1 WHERE id = ?", (ticket["id"],))
-            if total:
-                self.conn.execute(
-                    "UPDATE players SET balance = balance + ?, total_winnings = total_winnings + ? WHERE user_id = ?",
-                    (total, total, user_id),
-                )
-        return {"tickets": len(tickets), "total": total, "detail": detail}
+        with self._lock:
+            cutoff = (date.fromisoformat(today) - timedelta(days=history_days - 1)).isoformat()
+            tickets = self.conn.execute(
+                "SELECT * FROM tickets WHERE user_id = ? AND game = ? AND settled = 0 AND draw_date >= ? AND draw_date < ?",
+                (user_id, game, cutoff, today),
+            ).fetchall()
+            total = 0
+            detail: list[str] = []
+            with self.conn:
+                for ticket in tickets:
+                    spec = TicketSpec(**json.loads(ticket["spec_json"]))
+                    winning = self.get_draw(game, ticket["draw_date"])
+                    ticket_total = 0
+                    for primary in _ticket_primary_combinations(spec):
+                        for secondary in _ticket_secondary_combinations(spec):
+                            level, amount = prize_level(
+                                game,
+                                len(set(primary) & set(winning[0])),
+                                len(set(secondary) & set(winning[1])),
+                            )
+                            if amount:
+                                if game == GAME_FRONT and spec.additional and level in (1, 2):
+                                    amount = int(amount * 1.8)
+                                ticket_total += amount * spec.multiplier
+                    total += ticket_total
+                    detail.append(f"{ticket['draw_date']}：{ticket_total} 龙门币")
+                    self.conn.execute("UPDATE tickets SET settled = 1 WHERE id = ?", (ticket["id"],))
+                if total:
+                    self.conn.execute(
+                        "UPDATE players SET balance = balance + ?, total_winnings = total_winnings + ? WHERE user_id = ?",
+                        (total, total, user_id),
+                    )
+            return {"tickets": len(tickets), "total": total, "detail": detail}
 
     def leaderboard(self, limit: int = 10) -> list[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT nickname, balance, total_winnings FROM players ORDER BY (balance + total_winnings) DESC, balance DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        with self._lock:
+            return self.conn.execute(
+                "SELECT nickname, balance, total_winnings FROM players ORDER BY (balance + total_winnings) DESC, balance DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
 
     def cleanup_draws(self, keep_days: int, today: str) -> None:
         cutoff = (date.fromisoformat(today) - timedelta(days=keep_days - 1)).isoformat()
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute("DELETE FROM draws WHERE draw_date < ?", (cutoff,))
 
 

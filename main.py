@@ -2,26 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-import re
+import time
+from collections import OrderedDict
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any
 
-from astrbot.api import logger
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
-try:
-    from .lottery_engine import GAME_FRONT, GAME_RED, LotteryDB, parse_ticket, weighted_scratch
-except ImportError:
-    from lottery_engine import GAME_FRONT, GAME_RED, LotteryDB, parse_ticket, weighted_scratch
+from .lottery_engine import GAME_FRONT, GAME_RED, LotteryDB, parse_ticket
+from .scratch import DEFAULT_TIERS, LEGACY_TIERS, find_font, make_card, parse_tier, render_card, validate_table
 
 
+@register("astrbot_plugin_lottery_game", "DITF16", "双色球、大乐透与刮刮乐小游戏", "1.1.0")
 class LotteryPlugin(Star):
     """提供刮刮乐、双色球、大乐透和龙门币管理。"""
 
-    def __init__(self, context: Context, config: Any = None):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config or {}
         try:
@@ -29,9 +29,36 @@ class LotteryPlugin(Star):
 
             data_root = get_astrbot_data_path()
         except ImportError:
-            data_root = Path(__file__).resolve().parent / "data"
+            data_root = Path("data")
         self.data_dir = Path(data_root) / "plugin_data" / "astrbot_plugin_lottery_game"
         self.db = LotteryDB(self.data_dir / "lottery.db")
+        self._seen = OrderedDict()
+        self._scratch_lock = asyncio.Lock()
+        self._upgrade_scratch_config()
+
+    def _upgrade_scratch_config(self):
+        raw = self.config.get("scratch_tiers")
+        try:
+            old = json.loads(raw) if isinstance(raw, str) else raw
+        except ValueError:
+            return
+        if old and old != LEGACY_TIERS:
+            return
+        self.config["scratch_tiers"] = json.dumps(DEFAULT_TIERS, ensure_ascii=False, indent=2)
+        if hasattr(self.config, "save_config"):
+            self.config.save_config()
+        logger.info("刮刮乐已升级为多行奖金表；自定义旧概率表不会被覆盖。")
+
+    @staticmethod
+    def _message_key(event):
+        message_id = getattr(event.message_obj, "message_id", None)
+        if not message_id:
+            return ""
+        return json.dumps([str(event.unified_msg_origin), str(event.get_sender_id()), str(message_id)])
+
+    @staticmethod
+    def _recognized(message):
+        return message in ("彩票帮助", "彩票签到", "签到", "彩票余额", "余额", "富豪榜") or message.startswith(("刮刮乐", GAME_RED, GAME_FRONT))
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
@@ -39,9 +66,17 @@ class LotteryPlugin(Star):
         message = (event.message_str or "").strip()
         if message.startswith("/"):
             message = message[1:].strip()
-        if not message:
+        if not self._recognized(message):
             return
-
+        event.stop_event()
+        key = self._message_key(event)
+        now = time.monotonic()
+        while self._seen and (now - next(iter(self._seen.values())) > 600 or len(self._seen) >= 2048):
+            self._seen.popitem(last=False)
+        if key and key in self._seen:
+            return
+        if key:
+            self._seen[key] = now
         try:
             result = await self._dispatch(event, message)
         except ValueError as exc:
@@ -54,9 +89,32 @@ class LotteryPlugin(Star):
                 yield result
 
     async def _dispatch(self, event: AstrMessageEvent, message: str):
+        if message == "彩票帮助":
+            return event.plain_result(
+                "彩票游戏菜单\n"
+                "彩票签到：每天领取龙门币\n"
+                "彩票余额：余额与累计中奖\n"
+                "刮刮乐 [5/10/20/50/100]：默认10币，全部刮开，中奖自动到账\n"
+                "双色球 / 大乐透：查看投注参数与例子\n"
+                "双色球帮助 / 大乐透帮助：玩法简介\n"
+                "双色球兑奖 / 大乐透兑奖：领取已开奖彩票奖金\n"
+                "富豪榜：查看余额＋累计中奖前十名"
+            )
         user_id = str(event.get_sender_id())
         nickname = event.get_sender_name() or user_id
         today = date.today().isoformat()
+        if message.startswith("刮刮乐"):
+            return await self._scratch(event, user_id, nickname, today, message)
+        result = await asyncio.to_thread(
+            self._dispatch_sync,
+            user_id,
+            nickname,
+            today,
+            message,
+        )
+        return event.plain_result(result) if result is not None else None
+
+    def _dispatch_sync(self, user_id: str, nickname: str, today: str, message: str):
         yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
         self.db.get_draw(GAME_RED, yesterday)
         self.db.get_draw(GAME_FRONT, yesterday)
@@ -65,85 +123,66 @@ class LotteryPlugin(Star):
         if message in ("彩票签到", "签到"):
             checked, balance = self.db.checkin(user_id, nickname, today, self._daily_checkin())
             if checked:
-                return event.plain_result(f"签到成功，获得 {self._daily_checkin()} 龙门币。当前余额：{balance}")
-            return event.plain_result(f"今天已经签到过了。当前余额：{balance} 龙门币。")
+                return f"签到成功，获得 {self._daily_checkin()} 龙门币。当前余额：{balance}"
+            return f"今天已经签到过了。当前余额：{balance} 龙门币。"
 
         if message in ("彩票余额", "余额"):
-            self.db.upsert_player(user_id, nickname, today)
-            self.db.conn.commit()
-            row = self.db.player(user_id)
-            return event.plain_result(
+            row = self.db.ensure_player(user_id, nickname, today)
+            return (
                 f"{nickname}，当前余额：{row['balance']} 龙门币\n累计中奖：{row['total_winnings']} 龙门币"
             )
 
         if message == "富豪榜":
-            return event.plain_result(self._leaderboard_text())
-
-        if message.startswith("刮刮乐"):
-            return await self._scratch(event, user_id, nickname, today, message)
+            return self._leaderboard_text()
 
         for game in (GAME_RED, GAME_FRONT):
             if message == f"{game}帮助":
-                return event.plain_result(self._help_text(game))
+                return self._help_text(game)
             if message == f"{game}兑奖":
-                return event.plain_result(self._redeem(user_id, game, nickname, today))
+                return self._redeem(user_id, game, nickname, today)
             if message == game or message.startswith(game):
                 raw = message[len(game):].strip(" +:：")
                 if not raw:
-                    return event.plain_result(self._usage_text(game))
+                    return self._usage_text(game)
                 spec = parse_ticket(game, raw)
                 ticket_id = self.db.buy(user_id, nickname, today, spec, today)
-                return event.plain_result(
+                return (
                     f"购买成功！{game} {spec.mode}，{spec.combinations} 注，{spec.multiplier} 倍"
                     f"{'，追加' if spec.additional else ''}，扣除 {spec.stake} 龙门币。\n彩票编号：{ticket_id}\n开奖后可发送“{game}兑奖”。"
                 )
         return None
 
     async def _scratch(self, event: AstrMessageEvent, user_id: str, nickname: str, today: str, message: str):
-        match = re.search(r"(?:刮刮乐)\s*(5|10|20|50|100)?", message)
-        tier = int(match.group(1)) if match and match.group(1) else 10
-        tiers = self._scratch_config()
-        if str(tier) not in tiers:
-            raise ValueError("刮刮乐档位支持 5、10、20、50、100。")
-        self.db.upsert_player(user_id, nickname, today)
-        if int(self.db.player(user_id)["balance"]) < tier:
-            raise ValueError(f"余额不足，{tier} 龙门币刮刮乐需要先签到或购买彩票中奖。")
-        self.db.add_balance(user_id, -tier)
-        prize, _ = weighted_scratch(tiers[str(tier)])
-        self.db.add_balance(user_id, prize)
-        self.db.record_scratch(user_id, tier, prize)
-        balance = self.db.player(user_id)["balance"]
-        image = await self._scratch_image(nickname, tier, prize, balance)
-        if image:
-            yield_chain = event.chain_result([image])
-            return yield_chain
-        return event.plain_result(f"刮刮乐 {tier} 龙门币：{'恭喜中奖 ' + str(prize) + ' 龙门币！' if prize else '本次未中奖。'}当前余额：{balance}")
+        tier = parse_tier(message)
+        tiers = await asyncio.to_thread(self._scratch_config)
+        async with self._scratch_lock:
+            key = self._message_key(event)
+            if await asyncio.to_thread(self.db.scratch_seen, key):
+                return None
+            card = await asyncio.to_thread(make_card, tier, tiers[str(tier)])
+            sale = await asyncio.to_thread(self.db.buy_scratch, user_id, nickname, today, card, key)
+            if sale is None:
+                return None
+            ticket_id, balance = sale
+            try:
+                font = await asyncio.to_thread(find_font, self.config.get("scratch_font_path", ""))
+                path = self.data_dir / "scratch_images" / f"{ticket_id}.png"
+                await asyncio.to_thread(render_card, card, nickname, balance, ticket_id, path, font)
+                await asyncio.to_thread(self._prune_images, path.parent)
+                return event.image_result(str(path))
+            except Exception:
+                logger.exception("刮刮乐图片生成失败，保留已完成的票据与结算")
+                return event.plain_result(
+                    f"票号 {ticket_id} 已结算：命中 {card.hits} 行，奖金 {card.total} 龙门币，余额 {balance}。"
+                    "图片生成失败，本消息不会再次扣款。"
+                )
 
-    async def _scratch_image(self, nickname: str, tier: int, prize: int, balance: int):
-        safe_name = nickname.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        headline = f"恭喜中奖 {prize} 龙门币" if prize else "谢谢参与，下次好运"
-        color = "#d62828" if prize else "#475569"
-        template = f"""
-        <html><body style='margin:0;background:#e8edf3;font-family:Arial,"Microsoft YaHei",sans-serif;'>
-        <div style='width:720px;padding:30px;background:linear-gradient(135deg,#fff7d6,#ffffff);color:#172033;'>
-          <div style='display:flex;justify-content:space-between;align-items:center;'>
-            <div style='font-size:24px;font-weight:700;color:#a33b12;'>龙门彩票 · 幸运刮刮乐</div>
-            <div style='font-size:15px;color:#64748b;'>LOTTERY GAME</div>
-          </div>
-          <div style='margin-top:24px;padding:30px;text-align:center;border:5px solid #e0a52c;border-radius:16px;background:#fffdf4;'>
-            <div style='font-size:18px;color:#7c5b12;'>{safe_name} 的 {tier} 龙门币刮刮乐</div>
-            <div style='margin:22px auto;padding:26px 16px;border-radius:12px;background:#f3df9e;color:{color};font-size:40px;font-weight:800;'>{headline}</div>
-            <div style='font-size:17px;color:#64748b;'>全部刮开 · 余额 {balance} 龙门币</div>
-          </div>
-          <div style='margin-top:20px;color:#64748b;font-size:14px;'>祝你好运，理性游戏 · DITF16</div>
-        </div></body></html>
-        """
-        try:
-            url = await self.html_render(template, {}, options={"type": "png", "full_page": True})
-            return __import__("astrbot.api.message_components", fromlist=["Image"]).Image.fromURL(url)
-        except Exception:
-            logger.exception("刮刮乐图片生成失败")
-            return None
+    @staticmethod
+    def _prune_images(directory):
+        cutoff = time.time() - 86400 * 2
+        for path in directory.glob("*.png"):
+            if path.stem.isdigit() and path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
 
     def _daily_checkin(self) -> int:
         return max(0, int(self.config.get("daily_checkin", 50)))
@@ -154,6 +193,10 @@ class LotteryPlugin(Star):
             raw = json.loads(raw)
         if not isinstance(raw, dict) or not raw:
             raise ValueError("刮刮乐概率配置为空，请在插件配置中填写 JSON。")
+        if set(raw) != {str(tier) for tier in TIERS}:
+            raise ValueError("刮刮乐配置须包含 5、10、20、50、100 五档。")
+        for table in raw.values():
+            validate_table(table)
         return raw
 
     def _redeem(self, user_id: str, game: str, nickname: str, today: str) -> str:
@@ -191,9 +234,5 @@ class LotteryPlugin(Star):
         return "大乐透：选 1-35 中 5 个前区和 1-12 中 2 个后区，每注 2 龙门币。\n示例：大乐透 01 02 03 04 05 + 06 07 追加 倍投2\n追加每注 3 龙门币，只对一、二等奖按 80% 追加。开奖后发送“大乐透兑奖”。"
 
     async def terminate(self):
-        self.db.close()
-
-
-@register("astrbot_plugin_lottery_game", "DITF16", "双色球、大乐透与刮刮乐小游戏", "1.0.0")
-class Main(LotteryPlugin):
-    pass
+        async with self._scratch_lock:
+            self.db.close()
