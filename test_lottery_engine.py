@@ -7,6 +7,7 @@ from PIL import Image
 
 from lottery_engine import GAME_FRONT, GAME_RED, LotteryDB, generate_draw, parse_ticket, weighted_scratch
 from scratch import ScratchCard, ScratchRow, find_font, parse_tier, render_card
+from trend import render_trend
 
 
 def test_ticket_parsing_and_limits():
@@ -125,3 +126,35 @@ def test_db_work_is_offloaded_without_blocking_event_loop():
         return ticks
 
     assert asyncio.run(scenario()) == 6
+
+
+def test_new_dantuo_syntax_and_ticket_history():
+    red = parse_ticket(GAME_RED, "胆码 1 2 拖码 3 4 5 6 7 蓝 8")
+    assert red.primary_dan == (1, 2)
+    assert red.primary == (1, 2, 3, 4, 5, 6, 7)
+    assert red.secondary == (8,)
+
+    front = parse_ticket(GAME_FRONT, "前区胆码 1 2 前区拖码 3 4 5 6 7 后区 1 2")
+    assert front.primary_dan == (1, 2)
+    assert front.primary == (1, 2, 3, 4, 5, 6, 7)
+    assert front.secondary == (1, 2)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db = LotteryDB(Path(temp_dir) / "lottery.db")
+        day = date.today().isoformat()
+        db.checkin("300", "玩家", day, 500)
+        ticket_id = db.buy("300", "玩家", day, red, day)
+        rows = db.list_tickets("300", day)
+        assert rows and rows[0]["id"] == ticket_id
+        assert rows[0]["settled"] == 0
+        db.close()
+
+
+def test_trend_image():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path = Path(temp_dir) / "trend.png"
+        draws = [("2026-10-06", ((1, 2, 3, 4, 5, 6), (7,)))]
+        render_trend(GAME_RED, draws, path, find_font())
+        with Image.open(path) as image:
+            assert image.width == 980
+            image.verify()

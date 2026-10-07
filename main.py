@@ -15,9 +15,10 @@ from astrbot.api.star import Context, Star, register
 
 from .lottery_engine import GAME_FRONT, GAME_RED, LotteryDB, parse_ticket
 from .scratch import DEFAULT_TIERS, LEGACY_TIERS, TIERS, find_font, make_card, parse_tier, render_card, validate_table
+from .trend import render_trend
 
 
-@register("astrbot_plugin_lottery_game", "DITF16", "双色球、大乐透与刮刮乐小游戏", "1.1.1")
+@register("astrbot_plugin_lottery_game", "DITF16", "双色球、大乐透与刮刮乐小游戏", "1.2.0")
 class LotteryPlugin(Star):
     """提供刮刮乐、双色球、大乐透和龙门币管理。"""
 
@@ -58,7 +59,10 @@ class LotteryPlugin(Star):
 
     @staticmethod
     def _recognized(message):
-        return message in ("彩票帮助", "彩票签到", "签到", "彩票余额", "余额", "富豪榜") or message.startswith(("刮刮乐", GAME_RED, GAME_FRONT))
+        return message in (
+            "彩票帮助", "彩票签到", "签到", "彩票余额", "余额", "富豪榜", "我的彩票",
+            f"{GAME_RED}走势", f"{GAME_FRONT}走势",
+        ) or message.startswith(("刮刮乐", GAME_RED, GAME_FRONT))
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
@@ -98,6 +102,8 @@ class LotteryPlugin(Star):
                 "双色球 / 大乐透：查看投注参数与例子\n"
                 "双色球帮助 / 大乐透帮助：玩法简介\n"
                 "双色球兑奖 / 大乐透兑奖：领取已开奖彩票奖金\n"
+                "我的彩票：查看近30天购买记录和兑奖状态\n"
+                "双色球走势 / 大乐透走势：查看近30日开奖号码走势图\n"
                 "富豪榜：查看余额＋累计中奖前十名"
             )
         user_id = str(event.get_sender_id())
@@ -105,6 +111,8 @@ class LotteryPlugin(Star):
         today = date.today().isoformat()
         if message.startswith("刮刮乐"):
             return await self._scratch(event, user_id, nickname, today, message)
+        if message in (f"{GAME_RED}走势", f"{GAME_FRONT}走势"):
+            return await self._trend_image(event, message.removesuffix("走势"), today)
         result = await asyncio.to_thread(
             self._dispatch_sync,
             user_id,
@@ -134,6 +142,9 @@ class LotteryPlugin(Star):
 
         if message == "富豪榜":
             return self._leaderboard_text()
+
+        if message == "我的彩票":
+            return self._my_tickets_text(user_id, today)
 
         for game in (GAME_RED, GAME_FRONT):
             if message == f"{game}帮助":
@@ -206,10 +217,52 @@ class LotteryPlugin(Star):
         result = self.db.settle(user_id, game, today, max(30, int(self.config.get("draw_history_days", 30))))
         if not result["tickets"]:
             return f"暂时没有可兑奖的{game}彩票。开奖后次日即可兑奖，开奖号码保留 30 天。"
-        if result["total"]:
-            detail = "\n".join(result["detail"])
-            return f"{game}兑奖完成！本次获得 {result['total']} 龙门币。\n{detail}"
-        return f"{game}兑奖完成，本次没有中奖。共核对 {result['tickets']} 张彩票。"
+        lines = [f"{game}兑奖完成，共核对 {result['tickets']} 张彩票。"]
+        for record in result["records"]:
+            lines.append(self._settlement_line(game, record))
+        lines.append(f"本次合计获得：{result['total']} 龙门币。")
+        return "\n".join(lines)
+
+    def _my_tickets_text(self, user_id: str, today: str) -> str:
+        tickets = self.db.list_tickets(user_id, today, 30)
+        if not tickets:
+            return "近 30 天没有购买记录。"
+        lines = ["近 30 天购票记录："]
+        for ticket in tickets:
+            spec = json.loads(ticket["spec_json"])
+            numbers = self._ticket_numbers(spec)
+            state = "已兑奖" if ticket["settled"] else "未兑奖"
+            purchase_date = ticket["purchased_at"][:10]
+            lines.append(
+                f"#{ticket['id']}｜{ticket['game']}｜{numbers}｜购买日期 {purchase_date}｜{state}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _ticket_numbers(spec: dict) -> str:
+        primary = " ".join(str(number) for number in spec["primary"])
+        secondary = " ".join(str(number) for number in spec["secondary"])
+        return f"{primary}+{secondary}"
+
+    @classmethod
+    def _settlement_line(cls, game: str, record: dict) -> str:
+        winning_date = date.fromisoformat(record["draw_date"])
+        spec = record["spec"]
+        numbers = cls._ticket_numbers({
+            "primary": spec.primary,
+            "secondary": spec.secondary,
+        })
+        date_text = f"{winning_date.year}年{winning_date.month:02d}月{winning_date.day:02d}日"
+        if record["prize"]:
+            return f"{date_text} {numbers} {game}中奖{record['prize']}龙门币"
+        return f"{date_text} {numbers} {game}未中奖"
+
+    async def _trend_image(self, event: AstrMessageEvent, game: str, today: str):
+        draws = await asyncio.to_thread(self.db.history_draws, game, today, 30)
+        font = await asyncio.to_thread(find_font, self.config.get("scratch_font_path", ""))
+        path = self.data_dir / "trend_images" / f"{game}_{today}.png"
+        await asyncio.to_thread(render_trend, game, draws, path, font)
+        return event.image_result(str(path))
 
     def _leaderboard_text(self) -> str:
         rows = self.db.leaderboard()
@@ -243,21 +296,34 @@ class LotteryPlugin(Star):
     def _help_text(game: str) -> str:
         if game == GAME_RED:
             return (
-                "双色球玩法\n"
-                "选号：+ 左边为红球，从 1-33 选 6 个；+ 右边为蓝球，从 1-16 选 1 个；每注 2 龙门币。\n"
-                "单式：双色球 01 02 03 04 05 06 + 07\n"
-                "复式：红球选 7 个以上或蓝球选 2 个以上，系统自动组合；例：双色球 01 02 03 04 05 06 07 + 01 02\n"
-                "胆拖：设置必选胆码和搭配拖码；例：双色球 胆码:01,02;拖码:03,04,05,06,07;蓝:08\n"
-                "倍投：末尾加 倍投2，支持 2-99 倍，所有奖级按倍数结算。双色球不支持追加。\n"
-                "开奖后发送“双色球兑奖”，兑奖期保留 30 天。"
+                "------双色球玩法------\n"
+                "【简单形式】\n"
+                "发送命令（数字间要空格）：\"双色球 1 2 3 4 5 6+7\"\n\n"
+                "【规则如下】\n"
+                "选号：加号左边为红球，从数字1-33中选 6 个；+ 右边为蓝球，从数字1-16选 1 个；每注 2 龙门币。\n\n"
+                "单式（普通玩法）：发送命令：\"双色球 1 2 3 4 5 6+7\"\n\n"
+                "复式：红球选 7 个以上或蓝球选 2 个以上，系统自动组合；\n"
+                "发送命令：\"双色球 1 2 3 4 5 6 7+1 2\"\n\n"
+                "胆拖：设置必选胆码和搭配拖码；\n"
+                "发送命令：\"双色球 胆码 1 2 拖码 3 4 5 6 7 蓝 8\"\n\n"
+                "倍投：末尾加 倍投2，支持 2-99 倍，所有奖级按倍数结算。\n"
+                "例：发送命令\"双色球 1 2 3 4 5 6+7 倍投2\"\n"
+                "双色球不支持追加。开奖后发送“双色球兑奖”，兑奖期保留 30 天。"
             )
         return (
-            "大乐透玩法\n"
-            "选号：+ 左边为前区，从 1-35 选 5 个；+ 右边为后区，从 1-12 选 2 个；基本每注 2 龙门币。\n"
-            "单式：大乐透 01 02 03 04 05 + 06 07\n"
-            "复式：前区选 6 个以上或后区选 3 个以上自动组合；例：大乐透 前区:01,02,03,04,05,06;后区:01,02\n"
-            "胆拖：设置前区或后区胆码和拖码；例：大乐透 前区胆码:01,02;前区拖码:03,04,05,06,07;后区:01,02\n"
-            "倍投：末尾加 倍投2，支持 2-99 倍。追加：末尾加 追加，每注 3 龙门币，只有一、二等奖按基本奖金的 80% 增加追加奖金。\n"
+            "------大乐透玩法------\n"
+            "【简单形式】\n"
+            "发送命令（数字间要空格）：\"大乐透 1 2 3 4 5+1 2\"\n\n"
+            "【规则如下】\n"
+            "选号：加号左边为前区，从数字1-35中选 5 个；+ 右边为后区，从数字1-12选 2 个；基本每注 2 龙门币。\n\n"
+            "单式（普通玩法）：发送命令：\"大乐透 1 2 3 4 5+1 2\"\n\n"
+            "复式：前区选 6 个以上或后区选 3 个以上，系统自动组合；\n"
+            "发送命令：\"大乐透 1 2 3 4 5 6+1 2\"\n\n"
+            "胆拖：设置前区或后区胆码和拖码；\n"
+            "发送命令：\"大乐透 前区胆码 1 2 前区拖码 3 4 5 6 7 后区 1 2\"\n\n"
+            "倍投：末尾加 倍投2，支持 2-99 倍。\n"
+            "追加：末尾加 追加，每注 3 龙门币，只对一、二等奖增加 80% 的追加奖金。\n"
+            "例：发送命令\"大乐透 1 2 3 4 5+1 2 追加 倍投2\"\n"
             "开奖后发送“大乐透兑奖”，兑奖期保留 30 天。"
         )
 

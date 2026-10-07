@@ -75,10 +75,19 @@ def _validated(items: Iterable[int], low: int, high: int, label: str) -> tuple[i
 
 
 def _label_numbers(raw: str, labels: tuple[str, ...]) -> tuple[int, ...]:
-    for label in labels:
-        match = re.search(rf"{re.escape(label)}\s*[:：]?\s*([^;；|]+)", raw)
-        if match:
-            return _numbers(match.group(1))
+    all_labels = (
+        "红球胆码", "红球拖码", "前区胆码", "前区拖码", "后区胆码", "后区拖码",
+        "前胆码", "前拖码", "后胆码", "后拖码", "胆码", "拖码", "红球", "蓝球",
+        "前区号码", "后区号码", "前区", "后区", "红", "蓝", "前", "后", "号码",
+    )
+    pattern = "|".join(re.escape(label) for label in sorted(all_labels, key=len, reverse=True))
+    matches = list(re.finditer(rf"(?P<label>{pattern})\s*[:：]?", raw))
+    for index, match in enumerate(matches):
+        label = match.group("label")
+        if label not in labels:
+            continue
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(raw)
+        return _numbers(raw[match.end():end])
     return ()
 
 
@@ -122,6 +131,10 @@ def parse_ticket(game: str, raw: str) -> TicketSpec:
     secondary_low, secondary_high, secondary_need = 1, 12, 2
     primary_dan = _label_numbers(text, ("前区胆码", "前胆码")) if is_dantuo else ()
     primary_tuo = _label_numbers(text, ("前区拖码", "前拖码")) if is_dantuo else ()
+    if is_dantuo and not primary_dan:
+        primary_dan = _label_numbers(text, ("胆码",))
+    if is_dantuo and not primary_tuo:
+        primary_tuo = _label_numbers(text, ("拖码",))
     secondary_dan = _label_numbers(text, ("后区胆码", "后胆码")) if is_dantuo else ()
     secondary_tuo = _label_numbers(text, ("后区拖码", "后拖码")) if is_dantuo else ()
     primary = _label_numbers(text, ("前区", "前区号码", "前"))
@@ -377,6 +390,7 @@ class LotteryDB:
             ).fetchall()
             total = 0
             detail: list[str] = []
+            records: list[dict[str, Any]] = []
             with self.conn:
                 for ticket in tickets:
                     spec = TicketSpec(**json.loads(ticket["spec_json"]))
@@ -395,13 +409,34 @@ class LotteryDB:
                                 ticket_total += amount * spec.multiplier
                     total += ticket_total
                     detail.append(f"{ticket['draw_date']}：{ticket_total} 龙门币")
+                    records.append({
+                        "id": int(ticket["id"]),
+                        "draw_date": ticket["draw_date"],
+                        "spec": spec,
+                        "winning": winning,
+                        "prize": ticket_total,
+                    })
                     self.conn.execute("UPDATE tickets SET settled = 1 WHERE id = ?", (ticket["id"],))
                 if total:
                     self.conn.execute(
                         "UPDATE players SET balance = balance + ?, total_winnings = total_winnings + ? WHERE user_id = ?",
                         (total, total, user_id),
                     )
-            return {"tickets": len(tickets), "total": total, "detail": detail}
+            return {"tickets": len(tickets), "total": total, "detail": detail, "records": records}
+
+    def list_tickets(self, user_id: str, today: str, history_days: int = 30) -> list[sqlite3.Row]:
+        cutoff = (date.fromisoformat(today) - timedelta(days=history_days - 1)).isoformat()
+        with self._lock:
+            return self.conn.execute(
+                """SELECT id, game, purchased_at, draw_date, spec_json, stake, settled
+                FROM tickets WHERE user_id = ? AND purchased_at >= ? ORDER BY purchased_at DESC""",
+                (user_id, cutoff),
+            ).fetchall()
+
+    def history_draws(self, game: str, today: str, days: int = 30) -> list[tuple[str, tuple[tuple[int, ...], tuple[int, ...]]]]:
+        start = date.fromisoformat(today) - timedelta(days=1)
+        return [(day.isoformat(), self.get_draw(game, day.isoformat())) for day in
+                (start - timedelta(days=index) for index in range(days - 1, -1, -1))]
 
     def leaderboard(self, limit: int = 10) -> list[sqlite3.Row]:
         with self._lock:

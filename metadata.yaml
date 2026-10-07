@@ -1,7 +1,7 @@
 name: astrbot_plugin_lottery_game
 display_name: 彩票游戏
 desc: 双色球、大乐透与刮刮乐小游戏，使用龙门币结算
-version: 1.1.1
+version: 1.2.0
 author: DITF16
 repo: https://github.com/DITF16/astrbot_plugin_lottery_game
 support_platforms:
