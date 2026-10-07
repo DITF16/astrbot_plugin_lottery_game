@@ -84,7 +84,8 @@ def _label_numbers(raw: str, labels: tuple[str, ...]) -> tuple[int, ...]:
 
 def parse_ticket(game: str, raw: str) -> TicketSpec:
     """解析紧凑中文投注格式，支持单式、复式、胆拖、倍投和大乐透追加。"""
-    text = raw.strip()
+    # 兼容手机输入法常见的全角加号。
+    text = raw.strip().replace("＋", "+")
     additional = game == GAME_FRONT and bool(re.search(r"追加|加倍", text, re.I))
     multiplier_match = re.search(r"(?:倍投|倍|x|X)\s*(\d+)", text)
     multiplier = int(multiplier_match.group(1)) if multiplier_match else 1

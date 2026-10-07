@@ -14,6 +14,10 @@ def test_ticket_parsing_and_limits():
     assert single.combinations == 1
     assert single.stake == 2
 
+    full_width_plus = parse_ticket(GAME_RED, "01 02 03 04 05 06 ＋ 07")
+    assert full_width_plus.primary == single.primary
+    assert full_width_plus.secondary == single.secondary
+
     multi = parse_ticket(GAME_RED, "01 02 03 04 05 06 07 + 01 02 复式")
     assert multi.combinations == 14
     assert multi.stake == 28
@@ -24,6 +28,9 @@ def test_ticket_parsing_and_limits():
     extra = parse_ticket(GAME_FRONT, "01 02 03 04 05 + 06 07 追加 倍投2")
     assert extra.stake == 6
     assert extra.additional is True
+
+    full_width_front = parse_ticket(GAME_FRONT, "01 02 03 04 05 ＋ 06 07")
+    assert full_width_front.combinations == 1
 
 
 def test_draw_is_persisted_and_redemption_is_idempotent():
