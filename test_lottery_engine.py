@@ -11,6 +11,8 @@ from trend import render_trend
 from leaderboard import render_leaderboard
 from player_identity import QQNicknames
 from types import SimpleNamespace
+from unittest.mock import patch
+from nickname_render import nickname_image, font_info, _glyph
 
 
 def test_ticket_parsing_and_limits():
@@ -221,3 +223,47 @@ def test_qq_nickname_uses_account_name_and_daily_cache():
         assert await resolver.resolve(event, "200", "2026-10-23") == "200"
 
     asyncio.run(scenario())
+
+
+def test_nickname_font_fallback_and_grapheme_truncation():
+    primary = find_font()
+    emoji = "C:/Windows/Fonts/seguiemj.ttf"
+    if not Path(emoji).is_file():
+        from nickname_render import system_font
+        emoji = system_font("Noto Color Emoji")
+    if not emoji:
+        raise AssertionError("测试需安装 Noto Color Emoji 或 Segoe UI Emoji")
+    original = _glyph
+    calls = []
+
+    def capture(cluster, path, size, color):
+        calls.append((cluster, path))
+        return original(cluster, path, size, color)
+
+    with patch("nickname_render._glyph", side_effect=capture):
+        image = nickname_image("中文😀❤️👩‍💻🇨🇳👍🏽é", primary, emoji, 28, "#203b30", 380)
+        assert image.getbbox() is not None
+        assert ("中", primary) in calls
+        assert ("😀", emoji) in calls
+        assert ("👩‍💻", emoji) in calls
+        assert ("👍🏽", emoji) in calls
+        assert any(cluster == "é" for cluster, _ in calls)
+    short = nickname_image("中文😀" * 50, primary, emoji, 28, "#203b30", 100)
+    assert short.width == 100 and short.getbbox() is not None
+    assert 0x1f600 in font_info(emoji)[0]
+
+
+def test_fixed_strike_emoji_is_rescaled():
+    import nickname_render as renderer
+    class Probe:
+        def textbbox(self, *args, **kwargs):
+            return (0, -100, 109, 9)
+        def textlength(self, *args, **kwargs):
+            return 109
+        def text(self, *args, **kwargs):
+            pass
+    with patch.object(renderer, "_load_font", return_value=(object(), 109)), \
+         patch.object(renderer.ImageDraw, "Draw", return_value=Probe()):
+        tile, left, top, advance = renderer._glyph("fixed-strike-test", "fake.ttf", 28, "#000000")
+    assert tile.size == (28, 28)
+    assert advance == 28 and -26 < top < -25

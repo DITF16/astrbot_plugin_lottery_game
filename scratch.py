@@ -10,6 +10,11 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+try:
+    from .nickname_render import draw_nickname
+except ImportError:
+    from nickname_render import draw_nickname
+
 RNG = random.SystemRandom()
 TIERS = (5, 10, 20, 50, 100)
 
@@ -140,7 +145,7 @@ def find_font(custom=""):
     raise ValueError("未找到中文字体，请安装 fonts-noto-cjk 或在 scratch_font_path 设置中文字体路径。")
 
 
-def render_card(card, nickname, balance, ticket_id, path, font_path):
+def render_card(card, nickname, balance, ticket_id, path, font_path, emoji_font_path=""):
     """Fixed 840x1160 print-style ticket with a fully exposed textured play area."""
     image = Image.new("RGB", (840, 1160), "#b81e27")
     draw = ImageDraw.Draw(image)
@@ -197,7 +202,9 @@ def render_card(card, nickname, balance, ticket_id, path, font_path):
         draw.line((44, y+56, 794, y+56), fill="#99a2a2", width=1)
     headline = f"命中 {card.hits} 行  ·  合计 {card.total:,} 龙门币" if card.total else "本票未中奖  ·  谢谢参与"
     text(35, 957, headline, 32, gold, 770)
-    text(35, 1009, f"{nickname}  |  余额 {balance:,}", 23, "#ffffff", 765)
+    draw_nickname(image, (35, 1005), nickname, font_path, emoji_font_path,
+                  size=23, color="#ffffff", max_width=360)
+    text(420, 1009, f"余额 {balance:,}", 23, "#ffffff", 375)
     text(35, 1051, f"票号 {ticket_id}  /  虚拟龙门币游戏  /  DITF16", 20, "#ffffff", 770)
     for i in range(155):
         x = 36 + i * 3

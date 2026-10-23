@@ -4,6 +4,11 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+try:
+    from .nickname_render import draw_nickname
+except ImportError:
+    from nickname_render import draw_nickname
+
 
 def fit_text(draw, text, font, width):
     text = " ".join(str(text).split())
@@ -14,7 +19,7 @@ def fit_text(draw, text, font, width):
     return text + "..."
 
 
-def render_leaderboard(rows, path, font_path, today):
+def render_leaderboard(rows, path, font_path, today, emoji_font_path=""):
     rows = rows[:10]
     width, row_height = 1080, 108
     height = 302 + max(1, len(rows)) * row_height
@@ -39,8 +44,8 @@ def render_leaderboard(rows, path, font_path, today):
         badge = ("#b78520", "#77878c", "#a87150")[index] if index < 3 else "#dfe8e3"
         draw.ellipse((52, y + 23, 102, y + 73), fill=badge)
         draw.text((77, y + 48), str(index + 1), font=fonts[24], fill="#ffffff" if index < 3 else "#496356", anchor="mm")
-        name = fit_text(draw, row["nickname"] or row["user_id"], fonts[28], 380)
-        draw.text((126, y + 15), name, font=fonts[28], fill="#203b30")
+        draw_nickname(image, (126, y + 12), row["nickname"] or row["user_id"],
+                      font_path, emoji_font_path, size=28, max_width=380)
         draw.text((128, y + 58), f"QQ {row['user_id']}", font=fonts[18], fill="#748279")
         balance, winnings = int(row["balance"]), int(row["total_winnings"])
         total = fit_text(draw, f"{balance + winnings:,}", fonts[28], 440)

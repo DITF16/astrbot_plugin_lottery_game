@@ -21,7 +21,7 @@ from .leaderboard import render_leaderboard
 from .player_identity import QQNicknames
 
 
-@register("astrbot_plugin_lottery_game", "DITF16", "双色球、大乐透与刮刮乐小游戏", "1.2.1")
+@register("astrbot_plugin_lottery_game", "DITF16", "双色球、大乐透与刮刮乐小游戏", "1.2.2")
 class LotteryPlugin(Star):
     """提供刮刮乐、双色球、大乐透和龙门币管理。"""
 
@@ -182,7 +182,8 @@ class LotteryPlugin(Star):
             try:
                 font = await asyncio.to_thread(find_font, self.config.get("scratch_font_path", ""))
                 path = self.data_dir / "scratch_images" / f"{ticket_id}.png"
-                await asyncio.to_thread(render_card, card, nickname, balance, ticket_id, path, font)
+                await asyncio.to_thread(render_card, card, nickname, balance, ticket_id, path, font,
+                                        self.config.get("emoji_font_path", ""))
                 await asyncio.to_thread(self._prune_images, path.parent)
                 return event.image_result(str(path))
             except Exception:
@@ -280,7 +281,8 @@ class LotteryPlugin(Star):
         await asyncio.to_thread(self.db.update_qq_nicknames, updates, today)
         font = await asyncio.to_thread(find_font, self.config.get("scratch_font_path", ""))
         path = self.data_dir / "leaderboard_images" / f"{uuid4().int}.png"
-        await asyncio.to_thread(render_leaderboard, rows, path, font, today)
+        await asyncio.to_thread(render_leaderboard, rows, path, font, today,
+                                self.config.get("emoji_font_path", ""))
         await asyncio.to_thread(self._prune_images, path.parent)
         return event.image_result(str(path))
 

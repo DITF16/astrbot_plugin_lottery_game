@@ -22,8 +22,14 @@
   },
   "scratch_font_path": {
     "type": "string",
-    "description": "刮刮乐票面中文字体路径（可留空自动查找）",
+    "description": "图片中文主字体路径（刮刮乐、富豪榜及走势共用）",
     "default": "",
     "hint": "Windows 默认尝试微软雅黑或黑体；Linux 建议填写 NotoSansCJK-Regular.ttc 路径。"
+  },
+  "emoji_font_path": {
+    "type": "string",
+    "description": "用户昵称的符号/表情字体路径（可留空自动查找）",
+    "default": "",
+    "hint": "填写字体文件绝对路径，不是字体族名。Linux 推荐 NotoColorEmoji.ttf，支持彩色位图表情和中文混排；可用 fc-match -f '%{file}' 'Noto Color Emoji' 查询。符号和缺字另自动尝试 DejaVu Sans、Unifont、Noto Sans SC。字体未收录的字符显示问号。"
   }
 }
