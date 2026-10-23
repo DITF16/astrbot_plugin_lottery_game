@@ -305,6 +305,12 @@ class LotteryDB:
             ).fetchone())
 
     def buy_scratch(self, user_id, nickname, day, card, message_key):
+        result = self.buy_scratch_batch(user_id, nickname, day, [card], message_key)
+        return result[0] if result else None
+
+    def buy_scratch_batch(self, user_id, nickname, day, cards, message_key):
+        if not 1 <= len(cards) <= 10 or len({card.tier for card in cards}) != 1:
+            raise ValueError("每批须购买同档位的 1-10 张刮刮乐。")
         # Lock before reading balances or event IDs, including across plugin instances.
         with self._lock:
             self.conn.execute("BEGIN IMMEDIATE")
@@ -314,20 +320,26 @@ class LotteryDB:
                     return None
                 self.upsert_player(user_id, nickname, day)
                 balance = int(self.player(user_id)["balance"])
-                if balance < card.tier:
-                    raise ValueError(f"余额不足，需要 {card.tier} 龙门币，当前余额 {balance}。")
-                prize = card.total
+                cost = sum(card.tier for card in cards)
+                if balance < cost:
+                    raise ValueError(f"余额不足，需要 {cost} 龙门币，当前余额 {balance}。")
+                prize = sum(card.total for card in cards)
                 self.conn.execute(
                     "UPDATE players SET balance=balance-?+?, total_winnings=total_winnings+? WHERE user_id=?",
-                    (card.tier, prize, prize, user_id),
+                    (cost, prize, prize, user_id),
                 )
-                result = self.conn.execute(
-                    "INSERT INTO scratch_sales(message_key,user_id,tier,prize,card_json,created_at) VALUES(?,?,?,?,?,?)",
-                    (message_key or None, user_id, card.tier, prize,
-                     json.dumps(card.to_dict(), ensure_ascii=False), day),
-                )
+                sales = []
+                final_balance = balance - cost + prize
+                for index, card in enumerate(cards):
+                    key = message_key if index == 0 else json.dumps([message_key, index]) if message_key else None
+                    result = self.conn.execute(
+                        "INSERT INTO scratch_sales(message_key,user_id,tier,prize,card_json,created_at) VALUES(?,?,?,?,?,?)",
+                        (key or None, user_id, card.tier, card.total,
+                         json.dumps(card.to_dict(), ensure_ascii=False), day),
+                    )
+                    sales.append((int(result.lastrowid), final_balance))
                 self.conn.commit()
-                return int(result.lastrowid), balance - card.tier + prize
+                return sales
             except BaseException:
                 self.conn.rollback()
                 raise

@@ -20,14 +20,21 @@ TIERS = (5, 10, 20, 50, 100)
 
 
 def parse_tier(message):
+    return parse_scratch_order(message)[0]
+
+
+def parse_scratch_order(message):
     """Return the requested scratch price, or raise before any balance mutation."""
-    match = re.fullmatch(r"刮刮乐(?:\s*(\d+))?", message.strip())
+    match = re.fullmatch(r"刮刮乐(?:\s*(\d+)(?:\s+(\d+))?)?", message.strip())
     if not match:
-        raise ValueError("刮刮乐价格仅支持 5、10、20、50、100，例如：刮刮乐 10。")
+        raise ValueError("格式：刮刮乐 [价格] [数量]，价格支持 5、10、20、50、100，数量为 1-10。例如：刮刮乐 10 3。")
     tier = int(match.group(1) or 10)
     if tier not in TIERS:
         raise ValueError("刮刮乐价格仅支持 5、10、20、50、100，请重新选择。")
-    return tier
+    count = int(match.group(2) or 1)
+    if not 1 <= count <= 10:
+        raise ValueError("刮刮乐数量必须为 1-10 张，例如：刮刮乐 10 3。")
+    return tier, count
 PRIZES = {
     5: (5, 10, 15, 20, 30, 50, 60, 100, 200, 500, 1000, 5000, 10000, 50000, 200000),
     10: (10, 20, 30, 40, 50, 60, 100, 200, 500, 1000, 5000, 10000, 50000, 100000, 400000),

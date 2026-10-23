@@ -13,9 +13,10 @@ from uuid import uuid4
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.api.message_components import Node, Plain, Image
 
 from .lottery_engine import GAME_FRONT, GAME_RED, LotteryDB, parse_ticket
-from .scratch import DEFAULT_TIERS, LEGACY_TIERS, TIERS, find_font, make_card, parse_tier, render_card, validate_table
+from .scratch import DEFAULT_TIERS, LEGACY_TIERS, TIERS, find_font, make_card, parse_scratch_order, render_card, validate_table
 from .trend import render_trend
 from .leaderboard import render_leaderboard
 from .player_identity import QQNicknames
@@ -108,7 +109,7 @@ class LotteryPlugin(Star):
                 "彩票游戏菜单\n"
                 "彩票签到：每天领取龙门币\n"
                 "彩票余额：余额与累计中奖\n"
-                "刮刮乐 [5/10/20/50/100]：默认10币，全部刮开，中奖自动到账\n"
+                "刮刮乐 [价格] [数量]：价格5/10/20/50/100，默认10；数量1-10，默认1，合并转发图片\n"
                 "双色球 / 大乐透：查看投注参数与例子\n"
                 "双色球帮助 / 大乐透帮助：玩法简介\n"
                 "双色球兑奖 / 大乐透兑奖：领取已开奖彩票奖金\n"
@@ -174,30 +175,39 @@ class LotteryPlugin(Star):
         return None
 
     async def _scratch(self, event: AstrMessageEvent, user_id: str, nickname: str, today: str, message: str):
-        tier = parse_tier(message)
+        tier, count = parse_scratch_order(message)
         tiers = await asyncio.to_thread(self._scratch_config)
         async with self._scratch_lock:
             key = self._message_key(event)
             if await asyncio.to_thread(self.db.scratch_seen, key):
                 return None
-            card = await asyncio.to_thread(make_card, tier, tiers[str(tier)])
-            sale = await asyncio.to_thread(self.db.buy_scratch, user_id, nickname, today, card, key)
-            if sale is None:
+            cards = await asyncio.to_thread(lambda: [make_card(tier, tiers[str(tier)]) for _ in range(count)])
+            sales = await asyncio.to_thread(self.db.buy_scratch_batch, user_id, nickname, today, cards, key)
+            if sales is None:
                 return None
-            ticket_id, balance = sale
+        nodes = []
+        font = None
+        try:
+            font = await asyncio.to_thread(find_font, self.config.get("scratch_font_path", ""))
+        except Exception:
+            logger.exception("刮刮乐字体加载失败，使用已结算票据文字结果")
+        for index, (card, (ticket_id, balance)) in enumerate(zip(cards, sales), 1):
             try:
-                font = await asyncio.to_thread(find_font, self.config.get("scratch_font_path", ""))
+                if font is None:
+                    raise ValueError("字体不可用")
                 path = self.data_dir / "scratch_images" / f"{ticket_id}.png"
                 await asyncio.to_thread(render_card, card, nickname, balance, ticket_id, path, font,
                                         self.config.get("emoji_font_path", ""))
-                await asyncio.to_thread(self._prune_images, path.parent)
-                return event.image_result(str(path))
+                content = [Plain(f"第 {index}/{count} 张 · 票号 {ticket_id}"), Image.fromFileSystem(str(path))]
             except Exception:
                 logger.exception("刮刮乐图片生成失败，保留已完成的票据与结算")
-                return event.plain_result(
+                content = [Plain(
                     f"票号 {ticket_id} 已结算：命中 {card.hits} 行，奖金 {card.total} 龙门币，余额 {balance}。"
                     "图片生成失败，本消息不会再次扣款。"
-                )
+                )]
+            nodes.append(Node(uin=event.get_self_id(), name="龙门彩票", content=content))
+        await asyncio.to_thread(self._prune_images, self.data_dir / "scratch_images")
+        return event.chain_result(nodes)
 
     @staticmethod
     def _prune_images(directory):

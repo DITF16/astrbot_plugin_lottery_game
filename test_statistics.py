@@ -7,6 +7,7 @@ from datetime import date, timedelta
 
 from lottery_engine import LotteryDB, GAME_RED, parse_ticket
 from scratch import ScratchCard, ScratchRow, find_font
+from scratch import parse_scratch_order
 from statistics_store import StatisticsStore
 from leaderboard import render_leaderboard
 
@@ -89,3 +90,37 @@ def test_worker_runs_independently_and_stops():
             store.close()
             assert not store.thread.is_alive()
             db.close()
+
+
+def test_batch_scratch_defaults_limits_atomicity_and_statistics():
+    assert parse_scratch_order("刮刮乐") == (10,1)
+    assert parse_scratch_order("刮刮乐 5") == (5,1)
+    assert parse_scratch_order("刮刮乐 100 10") == (100,10)
+    for text in ("刮刮乐 33 2","刮刮乐 10 0","刮刮乐 10 11","刮刮乐 10 -1","刮刮乐 10 2.5","刮刮乐 10 2 3"):
+        try:
+            parse_scratch_order(text)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(text)
+    with tempfile.TemporaryDirectory() as directory:
+        db=LotteryDB(Path(directory)/"batch.db")
+        db.checkin("1","玩家","2026-10-23",25)
+        card=ScratchCard(10,22,[ScratchRow([22],20)],20)
+        try:
+            db.buy_scratch_batch("1","玩家","2026-10-23",[card]*3,"batch")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Batch used prizes to fund insufficient upfront balance")
+        assert db.player("1")["balance"]==25
+        assert db.conn.execute("SELECT COUNT(*) FROM scratch_sales").fetchone()[0]==0
+        sales=db.buy_scratch_batch("1","玩家","2026-10-23",[card]*2,"batch")
+        assert len(sales)==2 and sales[0][0]!=sales[1][0]
+        assert db.player("1")["balance"]==45
+        assert db.buy_scratch_batch("1","玩家","2026-10-23",[card]*2,"batch") is None
+        store=StatisticsStore(db.path)
+        store.process_batch()
+        assert store.user("1")["scratch_count"]==2
+        assert store.user("1")["rewards"]==[{"amount":20,"count":2}]
+        db.close()
