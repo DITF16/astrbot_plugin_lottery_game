@@ -171,6 +171,8 @@ def test_leaderboard_order_nickname_refresh_and_images():
         day = date.today().isoformat()
         db.checkin("100", "旧群名片", day, 50)
         db.checkin("200", "另一玩家", day, 100)
+        with db.conn:
+            db.conn.execute("UPDATE players SET total_winnings=120 WHERE user_id='200'")
         db.update_qq_nicknames([("100", "QQ昵称")], day)
         rows = [dict(row) for row in db.leaderboard()]
         assert rows[0]["user_id"] == "200"

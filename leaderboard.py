@@ -19,7 +19,28 @@ def fit_text(draw, text, font, width):
     return text + "..."
 
 
-def render_leaderboard(rows, path, font_path, today, emoji_font_path=""):
+def render_leaderboard(rows, path, font_path, today, emoji_font_path="", highest_rows=None):
+    if highest_rows is not None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            panels = []
+            for metric, items in (("累计中奖", rows), ("单张最高奖金", highest_rows)):
+                panel = Path(directory) / f"{metric}.png"
+                _render_board(items, panel, font_path, today, emoji_font_path, metric)
+                with Image.open(panel) as source:
+                    panels.append(source.copy())
+            combined = Image.new("RGB", (1080, sum(panel.height for panel in panels)), "#f3f6f5")
+            y = 0
+            for panel in panels:
+                combined.paste(panel, (0,y))
+                y += panel.height
+            Path(path).parent.mkdir(parents=True,exist_ok=True)
+            combined.save(path,"PNG")
+            return str(path)
+    return _render_board(rows,path,font_path,today,emoji_font_path,"累计中奖")
+
+
+def _render_board(rows, path, font_path, today, emoji_font_path, metric):
     rows = rows[:10]
     width, row_height = 1080, 108
     height = 302 + max(1, len(rows)) * row_height
@@ -28,12 +49,12 @@ def render_leaderboard(rows, path, font_path, today, emoji_font_path=""):
     fonts = {size: ImageFont.truetype(font_path, size) for size in (18, 20, 24, 28, 42)}
     draw.rectangle((0, 0, width, 192), fill="#123e37")
     draw.rectangle((40, 40, 46, 150), fill="#edc871")
-    draw.text((66, 40), "彩票富豪榜", font=fonts[42], fill="#ffffff")
-    draw.text((68, 110), "总资产 = 当前余额 + 累计中奖", font=fonts[24], fill="#c9dfd5")
+    draw.text((66, 40), f"{metric}榜", font=fonts[42], fill="#ffffff")
+    draw.text((68, 110), "彩票富豪榜 / 前十名", font=fonts[24], fill="#c9dfd5")
     draw.text((850, 54), "TOP 10", font=fonts[28], fill="#edc871")
     draw.text((850, 106), today, font=fonts[20], fill="#c9dfd5")
     draw.text((42, 215), "排名 / 玩家", font=fonts[20], fill="#60726a")
-    draw.text((1008, 215), "总资产 · 龙门币", font=fonts[20], fill="#60726a", anchor="ra")
+    draw.text((1008, 215), f"{metric} · 龙门币", font=fonts[20], fill="#60726a", anchor="ra")
 
     if not rows:
         draw.text((540, 305), "暂无玩家，发送“彩票签到”开始游戏", font=fonts[24], fill="#60726a", anchor="mm")
@@ -48,9 +69,11 @@ def render_leaderboard(rows, path, font_path, today, emoji_font_path=""):
                       font_path, emoji_font_path, size=28, max_width=380)
         draw.text((128, y + 58), f"QQ {row['user_id']}", font=fonts[18], fill="#748279")
         balance, winnings = int(row["balance"]), int(row["total_winnings"])
-        total = fit_text(draw, f"{balance + winnings:,}", fonts[28], 440)
+        highest = max(int(row.get("lottery_max",0)),int(row.get("scratch_max",0)))
+        value = winnings if metric == "累计中奖" else highest
+        total = fit_text(draw, f"{value:,}", fonts[28], 440)
         draw.text((1008, y + 15), total, font=fonts[28], fill="#936711", anchor="ra")
-        detail = fit_text(draw, f"余额 {balance:,}  /  累计中奖 {winnings:,}", fonts[18], 440)
+        detail = fit_text(draw, f"彩票最高 {int(row.get('lottery_max',0)):,} / 刮刮乐最高 {int(row.get('scratch_max',0)):,}", fonts[18], 440)
         draw.text((1008, y + 58), detail, font=fonts[18], fill="#60726a", anchor="ra")
     draw.text((40, height - 28), "龙门币彩票 · 资产排行", font=fonts[18], fill="#748279", anchor="lm")
     path = Path(path)

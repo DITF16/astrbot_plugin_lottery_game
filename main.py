@@ -19,9 +19,11 @@ from .scratch import DEFAULT_TIERS, LEGACY_TIERS, TIERS, find_font, make_card, p
 from .trend import render_trend
 from .leaderboard import render_leaderboard
 from .player_identity import QQNicknames
+from .statistics_store import StatisticsStore
+from .admin_web import LotteryWeb
 
 
-@register("astrbot_plugin_lottery_game", "DITF16", "双色球、大乐透与刮刮乐小游戏", "1.2.2")
+@register("astrbot_plugin_lottery_game", "DITF16", "双色球、大乐透与刮刮乐小游戏", "1.3.0")
 class LotteryPlugin(Star):
     """提供刮刮乐、双色球、大乐透和龙门币管理。"""
 
@@ -40,6 +42,10 @@ class LotteryPlugin(Star):
         self._scratch_lock = asyncio.Lock()
         self._nicknames = QQNicknames()
         self._upgrade_scratch_config()
+        self.statistics = StatisticsStore(self.db.path)
+        self.statistics.start()
+        self.admin_web = LotteryWeb(self.statistics)
+        self.admin_web.register(context)
 
     def _upgrade_scratch_config(self):
         raw = self.config.get("scratch_tiers")
@@ -108,7 +114,7 @@ class LotteryPlugin(Star):
                 "双色球兑奖 / 大乐透兑奖：领取已开奖彩票奖金\n"
                 "我的彩票：查看近30天购买记录和兑奖状态\n"
                 "双色球走势 / 大乐透走势：查看近30日开奖号码走势图\n"
-                "富豪榜：查看余额＋累计中奖前十名"
+                "富豪榜：查看累计中奖、单张最高奖金两个前十榜"
             )
         user_id = str(event.get_sender_id())
         today = date.today().isoformat()
@@ -270,7 +276,9 @@ class LotteryPlugin(Star):
         return event.image_result(str(path))
 
     async def _leaderboard_image(self, event: AstrMessageEvent, today: str):
-        rows = [dict(row) for row in await asyncio.to_thread(self.db.leaderboard)]
+        total_rows = [dict(row) for row in await asyncio.to_thread(self.db.leaderboard)]
+        highest_rows = [dict(row) for row in await asyncio.to_thread(self.db.leaderboard, 10, "highest")]
+        rows = list({row["user_id"]:row for row in total_rows + highest_rows}.values())
         names = await asyncio.gather(*(
             self._nicknames.resolve(event, str(row["user_id"]), today) for row in rows
         ))
@@ -278,11 +286,14 @@ class LotteryPlugin(Star):
         for row, nickname in zip(rows, names):
             row["nickname"] = nickname
             updates.append((str(row["user_id"]), nickname))
+        nicknames = dict(updates)
+        for row in total_rows + highest_rows:
+            row["nickname"] = nicknames[str(row["user_id"])]
         await asyncio.to_thread(self.db.update_qq_nicknames, updates, today)
         font = await asyncio.to_thread(find_font, self.config.get("scratch_font_path", ""))
         path = self.data_dir / "leaderboard_images" / f"{uuid4().int}.png"
-        await asyncio.to_thread(render_leaderboard, rows, path, font, today,
-                                self.config.get("emoji_font_path", ""))
+        await asyncio.to_thread(render_leaderboard, total_rows, path, font, today,
+                                self.config.get("emoji_font_path", ""), highest_rows=highest_rows)
         await asyncio.to_thread(self._prune_images, path.parent)
         return event.image_result(str(path))
 
@@ -340,5 +351,7 @@ class LotteryPlugin(Star):
         )
 
     async def terminate(self):
+        self.admin_web.unregister()
+        await asyncio.to_thread(self.statistics.close)
         async with self._scratch_lock:
-            self.db.close()
+            await asyncio.to_thread(self.db.close)

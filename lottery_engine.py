@@ -268,6 +268,31 @@ class LotteryDB:
             """
         )
         self.conn.commit()
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(tickets)")}
+        if "prize" not in columns:
+            self.conn.execute("ALTER TABLE tickets ADD COLUMN prize INTEGER")
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS player_stats (
+                user_id TEXT PRIMARY KEY,
+                lottery_count INTEGER NOT NULL DEFAULT 0,
+                scratch_count INTEGER NOT NULL DEFAULT 0,
+                lottery_max INTEGER NOT NULL DEFAULT 0,
+                scratch_max INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS scratch_rewards (
+                user_id TEXT NOT NULL, amount INTEGER NOT NULL, count INTEGER NOT NULL,
+                PRIMARY KEY(user_id, amount)
+            );
+            CREATE TABLE IF NOT EXISTS stats_cursor (kind TEXT PRIMARY KEY, value INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS stats_settled (ticket_id INTEGER PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS admin_audit (
+                id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, changed_at TEXT NOT NULL,
+                before_json TEXT NOT NULL, after_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS tickets_user ON tickets(user_id);
+            CREATE INDEX IF NOT EXISTS scratch_user ON scratch_sales(user_id);
+        """)
+        self.conn.commit()
 
     def close(self) -> None:
         with self._lock:
@@ -391,10 +416,12 @@ class LotteryDB:
             total = 0
             detail: list[str] = []
             records: list[dict[str, Any]] = []
+            # Generate missing draws before the payout transaction; get_draw commits inserts.
+            winning_by_date = {ticket["draw_date"]: self.get_draw(game, ticket["draw_date"]) for ticket in tickets}
             with self.conn:
                 for ticket in tickets:
                     spec = TicketSpec(**json.loads(ticket["spec_json"]))
-                    winning = self.get_draw(game, ticket["draw_date"])
+                    winning = winning_by_date[ticket["draw_date"]]
                     ticket_total = 0
                     for primary in _ticket_primary_combinations(spec):
                         for secondary in _ticket_secondary_combinations(spec):
@@ -416,7 +443,7 @@ class LotteryDB:
                         "winning": winning,
                         "prize": ticket_total,
                     })
-                    self.conn.execute("UPDATE tickets SET settled = 1 WHERE id = ?", (ticket["id"],))
+                    self.conn.execute("UPDATE tickets SET settled = 1, prize = ? WHERE id = ?", (ticket_total, ticket["id"]))
                 if total:
                     self.conn.execute(
                         "UPDATE players SET balance = balance + ?, total_winnings = total_winnings + ? WHERE user_id = ?",
@@ -438,10 +465,14 @@ class LotteryDB:
         return [(day.isoformat(), self.get_draw(game, day.isoformat())) for day in
                 (start - timedelta(days=index) for index in range(days - 1, -1, -1))]
 
-    def leaderboard(self, limit: int = 10) -> list[sqlite3.Row]:
+    def leaderboard(self, limit: int = 10, metric: str = "total") -> list[sqlite3.Row]:
+        order = "p.total_winnings" if metric == "total" else "MAX(COALESCE(s.lottery_max,0), COALESCE(s.scratch_max,0))"
         with self._lock:
             return self.conn.execute(
-                "SELECT user_id, nickname, balance, total_winnings FROM players ORDER BY (balance + total_winnings) DESC, balance DESC LIMIT ?",
+                f"""SELECT p.*, COALESCE(s.lottery_max,0) AS lottery_max,
+                COALESCE(s.scratch_max,0) AS scratch_max FROM players p
+                LEFT JOIN player_stats s ON s.user_id=p.user_id
+                ORDER BY {order} DESC, p.user_id ASC LIMIT ?""",
                 (limit,),
             ).fetchall()
 
