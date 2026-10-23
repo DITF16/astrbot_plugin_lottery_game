@@ -8,6 +8,7 @@ import time
 from collections import OrderedDict
 from datetime import date, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -16,9 +17,11 @@ from astrbot.api.star import Context, Star, register
 from .lottery_engine import GAME_FRONT, GAME_RED, LotteryDB, parse_ticket
 from .scratch import DEFAULT_TIERS, LEGACY_TIERS, TIERS, find_font, make_card, parse_tier, render_card, validate_table
 from .trend import render_trend
+from .leaderboard import render_leaderboard
+from .player_identity import QQNicknames
 
 
-@register("astrbot_plugin_lottery_game", "DITF16", "双色球、大乐透与刮刮乐小游戏", "1.2.0")
+@register("astrbot_plugin_lottery_game", "DITF16", "双色球、大乐透与刮刮乐小游戏", "1.2.1")
 class LotteryPlugin(Star):
     """提供刮刮乐、双色球、大乐透和龙门币管理。"""
 
@@ -35,6 +38,7 @@ class LotteryPlugin(Star):
         self.db = LotteryDB(self.data_dir / "lottery.db")
         self._seen = OrderedDict()
         self._scratch_lock = asyncio.Lock()
+        self._nicknames = QQNicknames()
         self._upgrade_scratch_config()
 
     def _upgrade_scratch_config(self):
@@ -107,8 +111,11 @@ class LotteryPlugin(Star):
                 "富豪榜：查看余额＋累计中奖前十名"
             )
         user_id = str(event.get_sender_id())
-        nickname = event.get_sender_name() or user_id
         today = date.today().isoformat()
+        if message == "富豪榜":
+            return await self._leaderboard_image(event, today)
+        nickname = await self._nicknames.resolve(event, user_id, today)
+        await asyncio.to_thread(self.db.update_qq_nicknames, [(user_id, nickname)], today)
         if message.startswith("刮刮乐"):
             return await self._scratch(event, user_id, nickname, today, message)
         if message in (f"{GAME_RED}走势", f"{GAME_FRONT}走势"):
@@ -139,9 +146,6 @@ class LotteryPlugin(Star):
             return (
                 f"{nickname}，当前余额：{row['balance']} 龙门币\n累计中奖：{row['total_winnings']} 龙门币"
             )
-
-        if message == "富豪榜":
-            return self._leaderboard_text()
 
         if message == "我的彩票":
             return self._my_tickets_text(user_id, today)
@@ -264,15 +268,21 @@ class LotteryPlugin(Star):
         await asyncio.to_thread(render_trend, game, draws, path, font)
         return event.image_result(str(path))
 
-    def _leaderboard_text(self) -> str:
-        rows = self.db.leaderboard()
-        if not rows:
-            return "富豪榜暂时没有玩家，发送“彩票签到”开始游戏。"
-        lines = ["🏆 彩票富豪榜（余额 + 累计中奖）"]
-        for index, row in enumerate(rows, 1):
-            total = int(row["balance"]) + int(row["total_winnings"])
-            lines.append(f"{index}. {row['nickname']}：{total} 龙门币（余额 {row['balance']}，累计中奖 {row['total_winnings']}）")
-        return "\n".join(lines)
+    async def _leaderboard_image(self, event: AstrMessageEvent, today: str):
+        rows = [dict(row) for row in await asyncio.to_thread(self.db.leaderboard)]
+        names = await asyncio.gather(*(
+            self._nicknames.resolve(event, str(row["user_id"]), today) for row in rows
+        ))
+        updates = []
+        for row, nickname in zip(rows, names):
+            row["nickname"] = nickname
+            updates.append((str(row["user_id"]), nickname))
+        await asyncio.to_thread(self.db.update_qq_nicknames, updates, today)
+        font = await asyncio.to_thread(find_font, self.config.get("scratch_font_path", ""))
+        path = self.data_dir / "leaderboard_images" / f"{uuid4().int}.png"
+        await asyncio.to_thread(render_leaderboard, rows, path, font, today)
+        await asyncio.to_thread(self._prune_images, path.parent)
+        return event.image_result(str(path))
 
     @staticmethod
     def _usage_text(game: str) -> str:

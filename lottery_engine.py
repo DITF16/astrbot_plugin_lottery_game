@@ -441,9 +441,16 @@ class LotteryDB:
     def leaderboard(self, limit: int = 10) -> list[sqlite3.Row]:
         with self._lock:
             return self.conn.execute(
-                "SELECT nickname, balance, total_winnings FROM players ORDER BY (balance + total_winnings) DESC, balance DESC LIMIT ?",
+                "SELECT user_id, nickname, balance, total_winnings FROM players ORDER BY (balance + total_winnings) DESC, balance DESC LIMIT ?",
                 (limit,),
             ).fetchall()
+
+    def update_qq_nicknames(self, players: list[tuple[str, str]], today: str) -> None:
+        with self._lock, self.conn:
+            self.conn.executemany(
+                "UPDATE players SET nickname = ?, last_nickname_date = ? WHERE user_id = ?",
+                [(nickname, today, user_id) for user_id, nickname in players],
+            )
 
     def cleanup_draws(self, keep_days: int, today: str) -> None:
         cutoff = (date.fromisoformat(today) - timedelta(days=keep_days - 1)).isoformat()

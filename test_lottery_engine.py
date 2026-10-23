@@ -8,6 +8,9 @@ from PIL import Image
 from lottery_engine import GAME_FRONT, GAME_RED, LotteryDB, generate_draw, parse_ticket, weighted_scratch
 from scratch import ScratchCard, ScratchRow, find_font, parse_tier, render_card
 from trend import render_trend
+from leaderboard import render_leaderboard
+from player_identity import QQNicknames
+from types import SimpleNamespace
 
 
 def test_ticket_parsing_and_limits():
@@ -158,3 +161,63 @@ def test_trend_image():
         with Image.open(path) as image:
             assert image.width == 980
             image.verify()
+
+
+def test_leaderboard_order_nickname_refresh_and_images():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db = LotteryDB(Path(temp_dir) / "lottery.db")
+        day = date.today().isoformat()
+        db.checkin("100", "旧群名片", day, 50)
+        db.checkin("200", "另一玩家", day, 100)
+        db.update_qq_nicknames([("100", "QQ昵称")], day)
+        rows = [dict(row) for row in db.leaderboard()]
+        assert rows[0]["user_id"] == "200"
+        assert rows[1]["nickname"] == "QQ昵称"
+        assert db.player("100")["balance"] == 50
+        for name, entries in (("empty", []), ("normal", rows), ("long", [
+            {"user_id": str(index), "nickname": "很长的昵称" * 40,
+             "balance": 999999999999999999, "total_winnings": 888888888888888888}
+            for index in range(10)
+        ])):
+            path = Path(temp_dir) / f"{name}.png"
+            render_leaderboard(entries, path, find_font(), day)
+            with Image.open(path) as image:
+                assert image.width == 1080
+                assert image.height == 302 + max(1, len(entries)) * 108
+                image.verify()
+        db.close()
+
+
+def test_qq_nickname_uses_account_name_and_daily_cache():
+    async def scenario():
+        calls = []
+
+        async def call_action(action, **kwargs):
+            calls.append((action, kwargs))
+            return {"nickname": "真实QQ昵称", "card": "群名片"}
+
+        event = SimpleNamespace(
+            get_platform_name=lambda: "aiocqhttp",
+            get_sender_id=lambda: "100",
+            bot=SimpleNamespace(api=SimpleNamespace(call_action=call_action)),
+            message_obj=SimpleNamespace(self_id="1", raw_message={
+                "sender": {"nickname": "消息QQ昵称", "card": "群名片"},
+            }),
+        )
+        resolver = QQNicknames()
+        assert await resolver.resolve(event, "100", "2026-10-23") == "真实QQ昵称"
+        assert await resolver.resolve(event, "100", "2026-10-23") == "真实QQ昵称"
+        assert len(calls) == 1
+        assert calls[0] == ("get_stranger_info", {"user_id": 100, "no_cache": True})
+        assert await resolver.resolve(event, "100", "2026-10-24") == "真实QQ昵称"
+        assert len(calls) == 2
+
+        async def unavailable(*args, **kwargs):
+            raise RuntimeError("API unavailable")
+
+        event.bot.api.call_action = unavailable
+        resolver = QQNicknames()
+        assert await resolver.resolve(event, "100", "2026-10-23") == "消息QQ昵称"
+        assert await resolver.resolve(event, "200", "2026-10-23") == "200"
+
+    asyncio.run(scenario())
