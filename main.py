@@ -13,7 +13,7 @@ from uuid import uuid4
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
-from astrbot.api.message_components import Node, Plain, Image
+from astrbot.api.message_components import Node, Nodes, Plain, Image
 
 from .lottery_engine import GAME_FRONT, GAME_RED, LotteryDB, parse_ticket
 from .scratch import DEFAULT_TIERS, LEGACY_TIERS, TIERS, find_font, make_card, parse_scratch_order, render_card, validate_table
@@ -207,7 +207,7 @@ class LotteryPlugin(Star):
                 )]
             nodes.append(Node(uin=event.get_self_id(), name="龙门彩票", content=content))
         await asyncio.to_thread(self._prune_images, self.data_dir / "scratch_images")
-        return event.chain_result(nodes)
+        return event.chain_result([Nodes(nodes)])
 
     @staticmethod
     def _prune_images(directory):
